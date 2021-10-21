@@ -16,3 +16,11 @@ It is a game launcher and updater ought to compare and download updated files to
 ## Known issues
 
 - Update may have trouble locating files when updater current directory contains non-UTF8 characters in its path.
+
+## Cross compilation
+
+If you need to compile Windows x32+x64, use [GOX](https://github.com/mitchellh/gox) package:
+
+1. Run `go get github.com/mitchellh/gox` to get `gox` binary (go/bin should be in your `PATH`).
+
+2. Once you've got gox, call  `gox -os="windows"` to build i386 + amd64 executables right in project directory.
