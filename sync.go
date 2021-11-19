@@ -120,57 +120,93 @@ func synchronize() {
 	loadedCount := 0
 	totalSize := int64(0)
 	totalCount := 0
-	for _, remoteFile := range remoteFiles {
-		if remoteFile.File.MimeType == "application/vnd.google-apps.folder" || remoteFile.File.Name == processName || remoteFile.File.Name == "FOnlineUpdater.cfg" {
-			continue
-		}
-		pathParts := []string{}
-		scope := remoteFile
-		for (*scope).Parent != nil {
-			pathParts = append([]string{(*scope).File.Name}, pathParts...)
-			scope = remoteFiles[(*scope).Parent.Id]
-		}
-		filePath := filepath.Join(pathParts...)
-		if filePath == "" {
-			continue
-		}
-		fileSize, fileModTime, fileError := getFileStats(filePath)
-		remoteLastModified, err := time.Parse(layout, remoteFile.File.ModifiedTime)
-		if err != nil {
-			setProgress(1, err.Error(), false)
-			return
-		}
-		shouldDownload := fileError != nil || fileSize == 0 || (remoteLastModified.After(fileModTime))
-		if !shouldDownload {
-			fileMD5 := getFileMd5(filePath)
-			shouldDownload = fileMD5 == "" || fileMD5 != remoteFile.File.Md5Checksum
-		}
-		if shouldDownload {
-			files = append(files, syncedFile{
-				File:    remoteFile.File,
-				Path:    filePath,
-				ModTime: remoteLastModified,
-			})
-			totalSize += remoteFile.File.Size
-			totalCount++
-		}
+
+	comparisonLock := sync.Mutex{}
+	comparisonWG := sync.WaitGroup{}
+
+	for _, remoteFilePlan := range remoteFiles {
+		comparisonWG.Add(1)
+		go func(remoteFile *remoteFile) {
+			defer comparisonWG.Done()
+			if remoteFile.File.MimeType == "application/vnd.google-apps.folder" {
+				return
+			}
+			if remoteFile.File.Name == processName || remoteFile.File.Name == "FOnlineUpdater.cfg" {
+				//return // uncomment if self-update is forbidden
+			}
+			pathParts := []string{}
+			scope := remoteFile
+			for (*scope).Parent != nil {
+				pathParts = append([]string{(*scope).File.Name}, pathParts...)
+				scope = remoteFiles[(*scope).Parent.Id]
+			}
+			filePath := filepath.Join(pathParts...)
+			if filePath == "" {
+				return
+			}
+			fileSize, fileModTime, fileError := getFileStats(filePath)
+			remoteLastModified, err := time.Parse(layout, remoteFile.File.ModifiedTime)
+			if err != nil {
+				setProgress(1, err.Error(), false)
+				return
+			}
+			//shouldDownloadReason := ""
+			shouldDownload := fileError != nil
+			if shouldDownload {
+				//shouldDownloadReason = "can't read"
+			}
+			if !shouldDownload {
+				shouldDownload = fileSize == 0
+				//shouldDownloadReason = "zero size"
+			}
+			if !shouldDownload {
+				shouldDownload = (remoteLastModified.After(fileModTime))
+				//shouldDownloadReason = "remote is newer"
+				if shouldDownload { // older date but same checksum is OK
+					fileMD5 := getFileMd5(filePath)
+					shouldDownload = fileMD5 == "" || fileMD5 != remoteFile.File.Md5Checksum
+					//shouldDownloadReason = "hash mismatch"
+				}
+			}
+			if shouldDownload && remoteFile.File.Name != "FOnlineConfig.cfg" {
+				//fmt.Printf("+ %s queued (%s)\n", remoteFile.File.Name, shouldDownloadReason)
+				comparisonLock.Lock()
+				files = append(files, syncedFile{
+					File:    remoteFile.File,
+					Path:    filePath,
+					ModTime: remoteLastModified,
+				})
+				comparisonLock.Unlock()
+				totalSize += remoteFile.File.Size
+				totalCount++
+			} else {
+				//fmt.Printf("- %s is OK\n", remoteFile.File.Name)
+			}
+		}(remoteFilePlan)
 	}
+
+	comparisonWG.Wait()
+
 	// ...
 	slice.Sort(files[:], func(i, j int) bool {
 		return files[i].File.Size > files[j].File.Size
 	})
 	interval := time.Millisecond * 500
-	wg := sync.WaitGroup{}
 	setProgress(0.04, "Comparison... OK", true)
+
 	setProgress(0.05, fmt.Sprintf("Synchronization... %d/%d", 0, totalCount), false)
+	syncLock := sync.Mutex{}
+	syncWG := sync.WaitGroup{}
 	for _, sFile := range files {
+		syncWG.Add(1)
 		time.Sleep(interval)
-		wg.Add(1)
-		// @todo: make it more memory-safe?
-		go func(realPath string, tmpPath string, id string, mod time.Time) {
+		go func(realPath string, tmpPath string, id string, mod time.Time, baseName string) {
+			defer syncWG.Done()
 			t1 := time.Now()
 			dir := filepath.Dir(realPath)
+			syncLock.Lock()
 			os.MkdirAll(dir, os.ModePerm)
+			syncLock.Unlock()
 			resp, err := service.Files.Get(id).Download()
 			if err != nil {
 				setProgress(1, err.Error(), false)
@@ -198,6 +234,12 @@ func synchronize() {
 			}
 			out.Close()
 			resp.Body.Close()
+
+			if baseName == processName {
+				bkpName := fmt.Sprintf("%s.bkp", processName)
+				os.Rename(processName, bkpName)
+			}
+
 			if err = os.Rename(tmpPath, realPath); err != nil {
 				setProgress(1, err.Error(), false)
 				return
@@ -207,15 +249,16 @@ func synchronize() {
 				setProgress(1, err.Error(), false)
 				return
 			}
-			wg.Done()
+			syncLock.Lock()
 			loadedCount += 1
 			diff := time.Now().Sub(t1)
 			if diff < interval {
 				interval = diff
 			}
-		}(sFile.Path, sFile.Path+".tmp", sFile.File.Id, sFile.ModTime)
+			syncLock.Unlock()
+		}(sFile.Path, sFile.Path+".tmp", sFile.File.Id, sFile.ModTime, sFile.File.Name)
 	}
-	wg.Wait()
+	syncWG.Wait()
 	setProgress(0.05, "Synchronization... OK", true)
 	setProgress(1, "All files up to date!", false)
 }
@@ -243,7 +286,7 @@ func getFileMd5(filePath string) string {
 		log.Fatal(err)
 	}
 
-	return string(h.Sum(nil))
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 type WriteCounter struct {
